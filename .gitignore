@@ -4,3 +4,15 @@ __pycache__/
 .ipynb_checkpoints/
 .vscode/
 *.csv
+.venv/
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+*.csv
+.venv/
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
+.vscode/
+*.csv
