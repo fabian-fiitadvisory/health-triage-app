@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
+import traceback  # ← show crashes in the UI
 
 from model_pipeline import (
     load_csv, build_ohe, map_constructs, construct_scores,
@@ -29,6 +30,14 @@ from model_pipeline import (
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Symptom → Disease + Triage", page_icon="🩺", layout="wide")
 st.title("🩺 Symptom → Disease Classifier + Triage")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Crash helper (surface errors instead of generic “Oh no”)
+# ──────────────────────────────────────────────────────────────────────────────
+def crash(e: BaseException):
+    st.error("App crashed:")
+    st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+    st.stop()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # (A) Cloud-safe local artifact loader
@@ -111,6 +120,17 @@ sim_temp = st.sidebar.slider("Centroid softmax temperature", 0.1, 2.0, 0.5, 0.1)
 # ──────────────────────────────────────────────────────────────────────────────
 artifacts_local = load_local_artifacts() if use_prebuilt else None
 
+# If user wants prebuilt but none exist in cloud, stop with clear guidance
+if use_prebuilt and artifacts_local is None:
+    st.error(
+        "No prebuilt model artifacts found in this environment.\n\n"
+        "Options:\n"
+        "• Upload a `.joblib` via the 'Load .joblib' section below, or\n"
+        "• Turn OFF 'Use prebuilt artifacts' and UPLOAD a CSV to train on cloud.\n\n"
+        "Tip: training on Streamlit Cloud can be heavy — prebuilt artifacts are recommended."
+    )
+    st.stop()
+
 # Flags/holders used across branches
 is_training_path = False
 eval_res = None
@@ -124,256 +144,259 @@ _save_vars = {}
 # ──────────────────────────────────────────────────────────────────────────────
 # (C) Main flow: either use artifacts OR run full train/eval pipeline
 # ──────────────────────────────────────────────────────────────────────────────
-if artifacts_local is not None:
-    # =========================
-    # PATH 1: Use prebuilt artifacts
-    # =========================
-    st.success("Using prebuilt artifacts (skipping training).")
+try:
+    if artifacts_local is not None:
+        # =========================
+        # PATH 1: Use prebuilt artifacts
+        # =========================
+        st.success("Using prebuilt artifacts (skipping training).")
 
-    # Minimal required keys for inference
-    required = ["clf", "ohe_vocab", "construct_models", "train_cols", "train_min", "train_max"]
-    missing = [k for k in required if k not in artifacts_local]
-    if missing:
-        st.error(f"Artifacts are missing required entries: {missing}. "
-                 "Re-train locally and click 'Save artifacts' to create a complete bundle.")
-        st.stop()
+        # Minimal required keys for inference
+        required = ["clf", "ohe_vocab", "construct_models", "train_cols", "train_min", "train_max"]
+        missing = [k for k in required if k not in artifacts_local]
+        if missing:
+            st.error(f"Artifacts are missing required entries: {missing}. "
+                     "Re-train locally and click 'Save artifacts' to create a complete bundle.")
+            st.stop()
 
-    # Unpack (use .get for optional fields)
-    clf_raw          = artifacts_local.get("clf")
-    cal_clf         = artifacts_local.get("cal_clf")               # may be None
-    ohe_vocab        = artifacts_local.get("ohe_vocab", [])
-    construct_models = artifacts_local.get("construct_models", {})
-    train_cols       = artifacts_local.get("train_cols", [])
-    train_min        = artifacts_local.get("train_min", pd.Series(dtype=float))
-    train_max        = artifacts_local.get("train_max", pd.Series(dtype=float))
-    class_prior      = artifacts_local.get("class_prior", None)
-    centroids_unit   = artifacts_local.get("centroids_unit", None)
-    construct_only   = artifacts_local.get("construct_only", None)
-    saved_use_cal    = bool(artifacts_local.get("use_calibration", False))
-    saved_use_smooth = bool(artifacts_local.get("use_smoothing", True))
-    saved_signal_thr = float(artifacts_local.get("signal_threshold", 0.05))
-    saved_prior_mix  = float(artifacts_local.get("prior_mix", 0.7))
-    saved_sim_temp   = float(artifacts_local.get("sim_temp", 0.5))
+        # Unpack (use .get for optional fields)
+        clf_raw          = artifacts_local.get("clf")
+        cal_clf         = artifacts_local.get("cal_clf")               # may be None
+        ohe_vocab        = artifacts_local.get("ohe_vocab", [])
+        construct_models = artifacts_local.get("construct_models", {})
+        train_cols       = artifacts_local.get("train_cols", [])
+        train_min        = artifacts_local.get("train_min", pd.Series(dtype=float))
+        train_max        = artifacts_local.get("train_max", pd.Series(dtype=float))
+        class_prior      = artifacts_local.get("class_prior", None)
+        centroids_unit   = artifacts_local.get("centroids_unit", None)
+        construct_only   = artifacts_local.get("construct_only", None)
+        saved_use_cal    = bool(artifacts_local.get("use_calibration", False))
+        saved_use_smooth = bool(artifacts_local.get("use_smoothing", True))
+        saved_signal_thr = float(artifacts_local.get("signal_threshold", 0.05))
+        saved_prior_mix  = float(artifacts_local.get("prior_mix", 0.7))
+        saved_sim_temp   = float(artifacts_local.get("sim_temp", 0.5))
 
-    # Pick model for inference (respect sidebar + availability)
-    predictor_model = cal_clf if (use_calibration and cal_clf is not None) else clf_raw
+        # Pick model for inference (respect sidebar + availability)
+        predictor_model = cal_clf if (use_calibration and cal_clf is not None) else clf_raw
 
-    # Thresholds (robust to missing keys)
-    q_emerg, q_urgent, triage_func = build_triage_from_artifacts(artifacts_local)
+        # Thresholds (robust to missing keys)
+        q_emerg, q_urgent, triage_func = build_triage_from_artifacts(artifacts_local)
 
-    # Build predictor (no CSV/training needed)
-    predict_patient = make_predictor(
-        ohe_columns=ohe_vocab,
-        construct_models=construct_models,
-        clf=predictor_model,
-        train_min=train_min,
-        train_max=train_max,
-        train_cols=train_cols,
-        triage_func=triage_func,
-        use_smoothing=use_smoothing if use_smoothing is not None else saved_use_smooth,
-        signal_threshold=signal_threshold if signal_threshold is not None else saved_signal_thr,
-        prior_mix=prior_mix if prior_mix is not None else saved_prior_mix,
-        sim_temp=sim_temp if sim_temp is not None else saved_sim_temp,
-        class_prior=class_prior,
-        centroids_unit=centroids_unit,
-        construct_only=construct_only
-    )
+        # Build predictor (no CSV/training needed)
+        predict_patient = make_predictor(
+            ohe_columns=ohe_vocab,
+            construct_models=construct_models,
+            clf=predictor_model,
+            train_min=train_min,
+            train_max=train_max,
+            train_cols=train_cols,
+            triage_func=triage_func,
+            use_smoothing=use_smoothing if use_smoothing is not None else saved_use_smooth,
+            signal_threshold=signal_threshold if signal_threshold is not None else saved_signal_thr,
+            prior_mix=prior_mix if prior_mix is not None else saved_prior_mix,
+            sim_temp=sim_temp if sim_temp is not None else saved_sim_temp,
+            class_prior=class_prior,
+            centroids_unit=centroids_unit,
+            construct_only=construct_only
+        )
 
-    st.success("Predictor ready (from artifacts).")
+        st.success("Predictor ready (from artifacts).")
 
-    # Save variables for "Save / Load" section
-    _save_vars = dict(
-        clf=clf_raw,
-        cal_clf=cal_clf,
-        ohe_vocab=ohe_vocab,
-        construct_models=construct_models,
-        train_cols=train_cols,
-        train_min=train_min,
-        train_max=train_max,
-        q_emerg=q_emerg,
-        q_urgent=q_urgent,
-        class_prior=class_prior,
-        centroids_unit=centroids_unit,
-        construct_only=construct_only,
-        use_calibration=use_calibration,
-        use_smoothing=use_smoothing,
-        signal_threshold=signal_threshold,
-        prior_mix=prior_mix,
-        sim_temp=sim_temp
-    )
+        # Save variables for "Save / Load" section
+        _save_vars = dict(
+            clf=clf_raw,
+            cal_clf=cal_clf,
+            ohe_vocab=ohe_vocab,
+            construct_models=construct_models,
+            train_cols=train_cols,
+            train_min=train_min,
+            train_max=train_max,
+            q_emerg=q_emerg,
+            q_urgent=q_urgent,
+            class_prior=class_prior,
+            centroids_unit=centroids_unit,
+            construct_only=construct_only,
+            use_calibration=use_calibration,
+            use_smoothing=use_smoothing,
+            signal_threshold=signal_threshold,
+            prior_mix=prior_mix,
+            sim_temp=sim_temp
+        )
 
-else:
-    # =========================
-    # PATH 2: Train pipeline (original flow)
-    # =========================
-    is_training_path = True
+    else:
+        # =========================
+        # PATH 2: Train pipeline (original flow)
+        # =========================
+        is_training_path = True
 
-    # Data
-    with st.spinner("Loading data..."):
-        if uploaded is not None:
+        # Data (training path) — require an uploaded CSV on cloud
+        with st.spinner("Loading data..."):
+            if uploaded is None:
+                st.error("Please upload a CSV to train (or enable 'Use prebuilt artifacts').")
+                st.stop()
             df = pd.read_csv(uploaded, low_memory=False)
             if "_id" not in df.columns:
                 df["_id"] = np.arange(len(df))
+        st.write("**Data shape:**", df.shape)
+
+        # Feature engineering
+        with st.spinner("Building features..."):
+            ohe = build_ohe(df)
+            mapping = map_constructs(ohe.columns)
+            FS, construct_models = construct_scores(ohe, mapping)
+
+        # Acuity + split
+        with st.spinner("Fitting Acuity (train-only) & splitting..."):
+            split = fit_acuity_minmax(FS, df, min_cases=min_cases, test_size=test_size)
+            FS = split["FS"]
+            X_train, y_train = split["X_train"], split["y_train"]
+            X_test,  y_test  = split["X_test"],  split["y_test"]
+            train_min, train_max = split["train_min"], split["train_max"]
+        st.success("Features ready.")
+
+        # Train RF
+        with st.spinner("Training RandomForest..."):
+            clf = train_rf(X_train, y_train, n_estimators=n_estimators, max_depth=max_depth)
+
+        # Triage thresholds
+        if use_proportion:
+            q_emerg, q_urgent, triage_func = triage_thresholds_from_proportions(
+                X_train["Acuity"], emerg_prop, urgent_prop
+            )
         else:
-            df = load_csv(csv_path)
-    st.write("**Data shape:**", df.shape)
+            q_emerg, q_urgent, triage_func = triage_thresholds_fixed(X_train)
 
-    # Feature engineering
-    with st.spinner("Building features..."):
-        ohe = build_ohe(df)
-        mapping = map_constructs(ohe.columns)
-        FS, construct_models = construct_scores(ohe, mapping)
+        # Evaluation
+        with st.spinner("Evaluating..."):
+            eval_res = evaluate_all(clf, X_test, y_test, X_train=X_train, y_train=y_train)
 
-    # Acuity + split
-    with st.spinner("Fitting Acuity (train-only) & splitting..."):
-        split = fit_acuity_minmax(FS, df, min_cases=min_cases, test_size=test_size)
-        FS = split["FS"]
-        X_train, y_train = split["X_train"], split["y_train"]
-        X_test,  y_test  = split["X_test"],  split["y_test"]
-        train_min, train_max = split["train_min"], split["train_max"]
-    st.success("Features ready.")
+        st.subheader("📈 Evaluation")
+        # Summary tables
+        if "report_dict" in eval_res:
+            rep = eval_res["report_dict"]
+            acc_overall = eval_res.get("accuracy", rep.get("accuracy", None))
+        else:
+            from sklearn.metrics import classification_report
+            _pred_tmp = clf.predict(X_test)
+            rep = classification_report(y_test, _pred_tmp, output_dict=True)
+            acc_overall = float(rep.get("accuracy", 0.0))
 
-    # Train RF
-    with st.spinner("Training RandomForest..."):
-        clf = train_rf(X_train, y_train, n_estimators=n_estimators, max_depth=max_depth)
+        topk_uncal = eval_res["topk"]
+        mrr_uncal = eval_res["mrr"]
+        topk_cal = eval_res.get("topk_cal")
+        mrr_cal = eval_res.get("mrr_cal")
 
-    # Triage thresholds
-    if use_proportion:
-        q_emerg, q_urgent, triage_func = triage_thresholds_from_proportions(
-            X_train["Acuity"], emerg_prop, urgent_prop
-        )
-    else:
-        q_emerg, q_urgent, triage_func = triage_thresholds_fixed(X_train)
-
-    # Evaluation
-    with st.spinner("Evaluating..."):
-        eval_res = evaluate_all(clf, X_test, y_test, X_train=X_train, y_train=y_train)
-
-    st.subheader("📈 Evaluation")
-    # Summary tables
-    if "report_dict" in eval_res:
-        rep = eval_res["report_dict"]
-        acc_overall = eval_res.get("accuracy", rep.get("accuracy", None))
-    else:
-        from sklearn.metrics import classification_report
-        _pred_tmp = clf.predict(X_test)
-        rep = classification_report(y_test, _pred_tmp, output_dict=True)
-        acc_overall = float(rep.get("accuracy", 0.0))
-
-    topk_uncal = eval_res["topk"]
-    mrr_uncal = eval_res["mrr"]
-    topk_cal = eval_res.get("topk_cal")
-    mrr_cal = eval_res.get("mrr_cal")
-
-    summary_rows = [
-        ["Accuracy", round(acc_overall, 3)],
-        ["Top-1 (uncal)", round(topk_uncal.get("Top-1", float("nan")), 3)],
-        ["Top-3 (uncal)", round(topk_uncal.get("Top-3", float("nan")), 3)],
-        ["Top-5 (uncal)", round(topk_uncal.get("Top-5", float("nan")), 3)],
-        ["MRR (uncal)", round(mrr_uncal, 3)],
-    ]
-    if topk_cal is not None and mrr_cal is not None:
-        summary_rows += [
-            ["Top-1 (cal)", round(topk_cal.get("Top-1", float("nan")), 3)],
-            ["Top-3 (cal)", round(topk_cal.get("Top-3", float("nan")), 3)],
-            ["Top-5 (cal)", round(topk_cal.get("Top-5", float("nan")), 3)],
-            ["MRR (cal)", round(mrr_cal, 3)],
+        summary_rows = [
+            ["Accuracy", round(acc_overall, 3)],
+            ["Top-1 (uncal)", round(topk_uncal.get("Top-1", float("nan")), 3)],
+            ["Top-3 (uncal)", round(topk_uncal.get("Top-3", float("nan")), 3)],
+            ["Top-5 (uncal)", round(topk_uncal.get("Top-5", float("nan")), 3)],
+            ["MRR (uncal)", round(mrr_uncal, 3)],
         ]
-    summary_rows += [
-        ["Emergency threshold", round(q_emerg, 6)],
-        ["Urgent threshold", round(q_urgent, 6)],
-    ]
-    summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
-    st.markdown("**Summary table**")
-    st.table(summary_df)
+        if topk_cal is not None and mrr_cal is not None:
+            summary_rows += [
+                ["Top-1 (cal)", round(topk_cal.get("Top-1", float("nan")), 3)],
+                ["Top-3 (cal)", round(topk_cal.get("Top-3", float("nan")), 3)],
+                ["Top-5 (cal)", round(topk_cal.get("Top-5", float("nan")), 3)],
+                ["MRR (cal)", round(mrr_cal, 3)],
+            ]
+        summary_rows += [
+            ["Emergency threshold", round(q_emerg, 6)],
+            ["Urgent threshold", round(q_urgent, 6)],
+        ]
+        summary_df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
+        st.markdown("**Summary table**")
+        st.table(summary_df)
 
-    # Macro / weighted averages
-    macro = rep.get("macro avg", {})
-    weighted = rep.get("weighted avg", {})
-    avg_df = pd.DataFrame.from_dict(
-        {
-            "macro avg": {
-                "precision": round(macro.get("precision", float("nan")), 3),
-                "recall":    round(macro.get("recall", float("nan")), 3),
-                "f1-score":  round(macro.get("f1-score", float("nan")), 3),
+        # Macro / weighted averages
+        macro = rep.get("macro avg", {})
+        weighted = rep.get("weighted avg", {})
+        avg_df = pd.DataFrame.from_dict(
+            {
+                "macro avg": {
+                    "precision": round(macro.get("precision", float("nan")), 3),
+                    "recall":    round(macro.get("recall", float("nan")), 3),
+                    "f1-score":  round(macro.get("f1-score", float("nan")), 3),
+                },
+                "weighted avg": {
+                    "precision": round(weighted.get("precision", float("nan")), 3),
+                    "recall":    round(weighted.get("recall", float("nan")), 3),
+                    "f1-score":  round(weighted.get("f1-score", float("nan")), 3),
+                },
+                "overall": {
+                    "precision": float("nan"),
+                    "recall":    float("nan"),
+                    "f1-score":  round(rep.get("accuracy", float("nan")), 3),
+                }
             },
-            "weighted avg": {
-                "precision": round(weighted.get("precision", float("nan")), 3),
-                "recall":    round(weighted.get("recall", float("nan")), 3),
-                "f1-score":  round(weighted.get("f1-score", float("nan")), 3),
-            },
-            "overall": {
-                "precision": float("nan"),
-                "recall":    float("nan"),
-                "f1-score":  round(rep.get("accuracy", float("nan")), 3),
-            }
-        },
-        orient="index"
-    )
-    st.markdown("**Averages**")
-    st.table(avg_df)
-
-    st.markdown("**Full classification report (text)**")
-    st.text(eval_res["report_text"])
-    st.write("Confusion matrix shape:", eval_res["cm_shape"])
-    if eval_res["dropped_for_topk"] > 0:
-        st.warning(
-            f"Dropped {eval_res['dropped_for_topk']} test rows for Top-k metrics (labels unseen in training)."
+            orient="index"
         )
-    st.write("Top-k (uncalibrated):", {k: round(v, 3) for k, v in eval_res["topk"].items()})
-    st.write("MRR (uncalibrated):", round(eval_res["mrr"], 3))
-    if eval_res["topk_cal"] is not None:
-        st.write("Top-k (calibrated):", {k: round(v, 3) for k, v in eval_res["topk_cal"].items()})
-        st.write("MRR (calibrated):", round(eval_res["mrr_cal"], 3))
+        st.markdown("**Averages**")
+        st.table(avg_df)
 
-    st.subheader("🚦 Triage thresholds in use")
-    st.write({"Emergency": q_emerg, "Urgent": q_urgent})
+        st.markdown("**Full classification report (text)**")
+        st.text(eval_res["report_text"])
+        st.write("Confusion matrix shape:", eval_res["cm_shape"])
+        if eval_res["dropped_for_topk"] > 0:
+            st.warning(
+                f"Dropped {eval_res['dropped_for_topk']} test rows for Top-k metrics (labels unseen in training)."
+            )
+        st.write("Top-k (uncalibrated):", {k: round(v, 3) for k, v in eval_res["topk"].items()})
+        st.write("MRR (uncalibrated):", round(eval_res["mrr"], 3))
+        if eval_res["topk_cal"] is not None:
+            st.write("Top-k (calibrated):", {k: round(v, 3) for k, v in eval_res["topk_cal"].items()})
+            st.write("MRR (calibrated):", round(eval_res["mrr_cal"], 3))
 
-    # Predictor prep (training path)
-    construct_only_cols, centroids_df, centroids_unit = make_centroids(X_train, y_train, clf.classes_)
-    class_prior = y_train.value_counts().reindex(clf.classes_).fillna(0).astype(float)
-    class_prior = (class_prior / class_prior.sum()).to_numpy()
+        st.subheader("🚦 Triage thresholds in use")
+        st.write({"Emergency": q_emerg, "Urgent": q_urgent})
 
-    predictor_model = eval_res["cal_model"] if (use_calibration and eval_res["cal_model"] is not None) else clf
+        # Predictor prep (training path)
+        construct_only_cols, centroids_df, centroids_unit = make_centroids(X_train, y_train, clf.classes_)
+        class_prior = y_train.value_counts().reindex(clf.classes_).fillna(0).astype(float)
+        class_prior = (class_prior / class_prior.sum()).to_numpy()
 
-    predict_patient = make_predictor(
-        ohe_columns=ohe.columns.tolist(),
-        construct_models=construct_models,
-        clf=predictor_model,
-        train_min=train_min,
-        train_max=train_max,
-        train_cols=X_train.columns.tolist(),
-        triage_func=triage_func,
-        use_smoothing=use_smoothing,
-        signal_threshold=signal_threshold,
-        prior_mix=prior_mix,
-        sim_temp=sim_temp,
-        class_prior=class_prior,
-        centroids_unit=centroids_unit,
-        construct_only=construct_only_cols
-    )
-    st.success("Predictor ready.")
+        predictor_model = eval_res["cal_model"] if (use_calibration and eval_res["cal_model"] is not None) else clf
 
-    # Save variables for "Save / Load" section
-    _save_vars = dict(
-        clf=clf,
-        cal_clf=eval_res.get("cal_model"),
-        ohe_vocab=ohe.columns.tolist(),
-        construct_models=construct_models,
-        train_cols=X_train.columns.tolist(),
-        train_min=train_min,
-        train_max=train_max,
-        q_emerg=q_emerg,
-        q_urgent=q_urgent,
-        class_prior=class_prior,
-        centroids_unit=centroids_unit,
-        construct_only=construct_only_cols,
-        use_calibration=use_calibration,
-        use_smoothing=use_smoothing,
-        signal_threshold=signal_threshold,
-        prior_mix=prior_mix,
-        sim_temp=sim_temp
-    )
+        predict_patient = make_predictor(
+            ohe_columns=ohe.columns.tolist(),
+            construct_models=construct_models,
+            clf=predictor_model,
+            train_min=train_min,
+            train_max=train_max,
+            train_cols=X_train.columns.tolist(),
+            triage_func=triage_func,
+            use_smoothing=use_smoothing,
+            signal_threshold=signal_threshold,
+            prior_mix=prior_mix,
+            sim_temp=sim_temp,
+            class_prior=class_prior,
+            centroids_unit=centroids_unit,
+            construct_only=construct_only_cols
+        )
+        st.success("Predictor ready.")
+
+        # Save variables for "Save / Load" section
+        _save_vars = dict(
+            clf=clf,
+            cal_clf=eval_res.get("cal_model"),
+            ohe_vocab=ohe.columns.tolist(),
+            construct_models=construct_models,
+            train_cols=X_train.columns.tolist(),
+            train_min=train_min,
+            train_max=train_max,
+            q_emerg=q_emerg,
+            q_urgent=q_urgent,
+            class_prior=class_prior,
+            centroids_unit=centroids_unit,
+            construct_only=construct_only_cols,
+            use_calibration=use_calibration,
+            use_smoothing=use_smoothing,
+            signal_threshold=signal_threshold,
+            prior_mix=prior_mix,
+            sim_temp=sim_temp
+        )
+except Exception as e:
+    crash(e)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # (D) UI: Try a prediction (works in both modes)
