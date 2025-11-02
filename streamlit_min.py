@@ -4,25 +4,23 @@
 # source .venv/bin/activate
 # python -m streamlit run triage_app.py --server.port 5000
 
-# triage_app.py
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Imports
 # ──────────────────────────────────────────────────────────────────────────────
-import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
-# import requests  # ← OPTIONAL (only if you enable the auto-download block below)
+import os, hashlib
+import requests  # ← for auto-download
 
 from model_pipeline import (
     load_csv, build_ohe, map_constructs, construct_scores,
     fit_acuity_minmax, train_rf, evaluate_all,
     make_centroids, make_predictor,
     triage_thresholds_from_proportions, triage_thresholds_fixed,
-    save_artifacts, load_artifacts as _joblib_load_artifacts
+    save_artifacts, load_artifacts as _joblib_load_artifacts  # your helper
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -30,6 +28,48 @@ from model_pipeline import (
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Symptom → Disease + Triage", page_icon="🩺", layout="wide")
 st.title("🩺 Symptom → Disease Classifier + Triage")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# (A0) Optional: auto-download artifacts from a URL in secrets
+# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _download_artifact_if_needed():
+    """
+    If triage_model_artifacts.joblib is missing, try to download from st.secrets['artifact_url'].
+    Optional integrity check via st.secrets['artifact_sha256'].
+    """
+    p = Path("triage_model_artifacts.joblib")
+    if p.exists():
+        return str(p)
+
+    url = st.secrets.get("artifact_url", None)
+    if not url:
+        # nothing to do; app will run in TRAIN/DEMO unless user uploads a joblib
+        return None
+
+    try:
+        st.info("Downloading model artifacts…")
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        p.write_bytes(resp.content)
+
+        # optional checksum
+        sha = st.secrets.get("artifact_sha256")
+        if sha:
+            got = hashlib.sha256(p.read_bytes()).hexdigest()
+            if got.lower() != str(sha).lower():
+                p.unlink(missing_ok=True)
+                st.error("Artifact checksum mismatch. Please update secrets or the file.")
+                return None
+
+        st.success("Artifacts downloaded.")
+        return str(p)
+    except Exception as e:
+        st.warning(f"Could not download artifacts: {e}")
+        return None
+
+# Call once at startup (safe no-op if file already present)
+_download_artifact_if_needed()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # (A) Cloud-safe local artifact loader
@@ -51,31 +91,6 @@ def load_local_artifacts():
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
-# (A1 - OPTIONAL) Auto-download artifact from a GitHub Release (disabled by default)
-# Add `requests` to requirements.txt and set a secret ARTIFACT_URL if you enable this.
-# ──────────────────────────────────────────────────────────────────────────────
-# ARTIFACT_PATH = "triage_model_artifacts.joblib"
-# ARTIFACT_URL = os.getenv("ARTIFACT_URL", "").strip()
-#
-# def ensure_artifact_present():
-#     if Path(ARTIFACT_PATH).exists():
-#         return True
-#     if not ARTIFACT_URL:
-#         return False
-#     try:
-#         st.info("Downloading model artifacts…")
-#         with requests.get(ARTIFACT_URL, stream=True, timeout=60) as r:
-#             r.raise_for_status()
-#             with open(ARTIFACT_PATH, "wb") as f:
-#                 for chunk in r.iter_content(1024 * 1024):
-#                     if chunk:
-#                         f.write(chunk)
-#         return Path(ARTIFACT_PATH).exists()
-#     except Exception as e:
-#         st.error(f"Failed to download artifacts: {e}")
-#         return False
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Helper: build triage thresholds even if old artifacts lack them
 # ──────────────────────────────────────────────────────────────────────────────
 def build_triage_from_artifacts(art):
@@ -94,7 +109,7 @@ def build_triage_from_artifacts(art):
             return "Routine"
         return q_e, q_u, triage_func
 
-    # Fallback (only used if old artifacts didn’t save thresholds)
+    # Fallback
     q_e_default, q_u_default = 0.90, 0.60
     st.info("Artifacts missing triage thresholds — using defaults (Emergency≥0.90, Urgent≥0.60). "
             "Train once and re-save artifacts to persist real thresholds.")
@@ -135,21 +150,7 @@ sim_temp = st.sidebar.slider("Centroid softmax temperature", 0.1, 2.0, 0.5, 0.1)
 # ──────────────────────────────────────────────────────────────────────────────
 # (B) Mode select: attempt to load artifacts if requested
 # ──────────────────────────────────────────────────────────────────────────────
-# If you enable the optional downloader, call ensure_artifact_present() first:
-# if use_prebuilt:
-#     _ = ensure_artifact_present()
-
 artifacts_local = load_local_artifacts() if use_prebuilt else None
-
-# **FIX 1**: Early STOP if prebuilt requested but artifact missing on cloud
-if use_prebuilt and artifacts_local is None:
-    st.error(
-        "No prebuilt model artifacts found in this environment.\n\n"
-        "Options:\n"
-        "• Upload a .joblib in the **Load .joblib** section below, or\n"
-        "• Turn OFF **Use prebuilt artifacts** and upload a CSV to train here."
-    )
-    st.stop()
 
 # Flags/holders used across branches
 is_training_path = False
@@ -180,7 +181,7 @@ if artifacts_local is not None:
 
     # Unpack (use .get for optional fields)
     clf_raw          = artifacts_local.get("clf")
-    cal_clf         = artifacts_local.get("cal_clf")               # may be None
+    cal_clf          = artifacts_local.get("cal_clf")               # may be None
     ohe_vocab        = artifacts_local.get("ohe_vocab", [])
     construct_models = artifacts_local.get("construct_models", {})
     train_cols       = artifacts_local.get("train_cols", [])
@@ -255,15 +256,7 @@ else:
             if "_id" not in df.columns:
                 df["_id"] = np.arange(len(df))
         else:
-            # **FIX 2**: Only read csv_path if it exists on the cloud filesystem
-            p = Path(csv_path)
-            if not p.exists():
-                st.error(
-                    f"CSV not found at '{csv_path}'. Please upload a CSV in the sidebar "
-                    "or provide a valid path that exists on this server."
-                )
-                st.stop()
-            df = load_csv(p)
+            df = load_csv(csv_path)
     st.write("**Data shape:**", df.shape)
 
     # Feature engineering
@@ -482,7 +475,7 @@ with c2:
     up = st.file_uploader("Load .joblib", type=["joblib"], key="art_up")
     if up is not None:
         try:
-            art = _joblib_load_artifacts(up)
+            art = _joblib_load_artifacts(up)  # use your helper
             st.success("Artifacts loaded.")
             st.json({
                 "has_calibrated": art.get("cal_clf") is not None,
@@ -497,5 +490,4 @@ with c2:
 # (F) If we skipped training, give a small note where evaluation would be
 # ──────────────────────────────────────────────────────────────────────────────
 if artifacts_local is not None:
-    st.info("Running in artifacts mode: training metrics are not shown. "
-            "Turn OFF 'Use prebuilt artifacts' to train/evaluate here (requires uploading a CSV).")
+    st.info("Running in artifacts mode: training metrics are not shown. Switch off 'Use prebuilt artifacts' to train/evaluate here.")
