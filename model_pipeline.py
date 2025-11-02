@@ -1,14 +1,11 @@
-# %%
-# triage_pipeline.py
-# End-to-end: load → wrangle symptoms → construct scoring → train RF → triage thresholds → predictor
-
-
 # model_pipeline.py
+# End-to-end helpers: load → OHE → construct scores → train RF → triage thresholds → predictor
+
 from pathlib import Path
+from typing import Union, Dict, Tuple, Optional
 import json
 import numpy as np
 import pandas as pd
-from typing import Union
 
 from sklearn.model_selection import train_test_split
 from sklearn.decomposition import TruncatedSVD
@@ -20,7 +17,7 @@ import joblib
 # -------------------------
 # Construct keyword map
 # -------------------------
-CONSTRUCT_KEYWORDS = {
+CONSTRUCT_KEYWORDS: Dict[str, list] = {
     "Cardio/Resp": ["chest", "palpit", "breath", "dysp", "cough", "wheeze", "tachy", "orthop", "cyanosis", "hemoptysis"],
     "Neuro": ["seiz", "confus", "stiff", "photophobia", "focal", "weak", "numb", "paral", "aphas", "headache", "migra", "dizzi", "syncope"],
     "GI": ["nausea", "vomit", "diarr", "abdominal", "abdomen", "constip", "hematem", "melena", "jaund", "appetite", "peristalsis", "pyloric", "mass"],
@@ -34,22 +31,49 @@ CONSTRUCT_KEYWORDS = {
 }
 
 # -------------------------
-# Data loading & OHE
+# Safe CSV loading (cloud-friendly)
 # -------------------------
+def safe_load_csv(uploaded_file, csv_path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Load CSV from an uploaded file-like or a local path.
+    If not found, return a tiny demo DataFrame so the app can still boot.
+    """
+    try:
+        if uploaded_file is not None:
+            df = pd.read_csv(uploaded_file, low_memory=False)
+        else:
+            p = Path(csv_path)
+            if p.exists():
+                df = pd.read_csv(p, low_memory=False)
+            else:
+                # Minimal demo DF with one symptom + label
+                df = pd.DataFrame({"Symptom_1": ["Fever"], "Disease": ["demo"]})
+        if "_id" not in df.columns:
+            df = df.copy()
+            df["_id"] = np.arange(len(df))
+        return df
+    except Exception:
+        # Last-resort demo DF if reading fails for any reason
+        df = pd.DataFrame({"Symptom_1": ["Fever"], "Disease": ["demo"]})
+        df["_id"] = np.arange(len(df))
+        return df
+
 def load_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
+    """Strict CSV loader (raises if file not found). Prefer safe_load_csv in Streamlit apps."""
     df = pd.read_csv(csv_path, low_memory=False)
     if "_id" not in df.columns:
         df = df.copy()
         df["_id"] = np.arange(len(df))
     return df
 
-
+# -------------------------
+# One-hot encoding of symptoms
+# -------------------------
 def build_ohe(df: pd.DataFrame) -> pd.DataFrame:
     symptom_cols = [c for c in df.columns if c.startswith("Symptom_")]
     if not symptom_cols:
         raise ValueError("No columns starting with 'Symptom_' found.")
-    long = df.melt(id_vars=["_id"], value_vars=symptom_cols,
-                   var_name="slot", value_name="symptom")
+    long = df.melt(id_vars=["_id"], value_vars=symptom_cols, var_name="slot", value_name="symptom")
     long["symptom"] = long["symptom"].astype(str).str.strip()
     long = long.replace({"symptom": {"nan": np.nan}}).dropna(subset=["symptom"])
     long["symptom"] = (
@@ -79,7 +103,15 @@ def map_constructs(ohe_cols) -> dict:
         mapping.setdefault(cons, []).append(s)
     return mapping
 
+# -------------------------
+# Construct scores (per-construct factor)
+# -------------------------
 def construct_scores(ohe: pd.DataFrame, mapping: dict):
+    """
+    Returns:
+      FS: DataFrame with columns ['_id', <constructs...>] and NO 'Acuity' yet
+      construct_models: dict describing how each construct score was computed
+    """
     construct_models, scores = {}, {}
     for cons, syms in mapping.items():
         syms = [s for s in syms if s in ohe.columns]
@@ -107,6 +139,9 @@ def construct_scores(ohe: pd.DataFrame, mapping: dict):
 # Acuity + split
 # -------------------------
 def fit_acuity_minmax(FS: pd.DataFrame, df_labels: pd.DataFrame, min_cases: int, test_size: float, seed=42):
+    """
+    Computes Acuity via min–max scaling on TRAIN ONLY. Returns train/test splits and scaling params.
+    """
     construct_cols = [c for c in FS.columns if c not in ("Other/Unmapped", "Acuity", "_id")]
     data_full = FS.merge(df_labels[["_id", "Disease"]], on="_id", how="left").dropna(subset=["Disease"]).copy()
     counts = data_full["Disease"].value_counts()
@@ -157,12 +192,11 @@ def train_rf(X_train, y_train, n_estimators=200, max_depth=12, seed=42):
     clf.fit(X_train, y_train)
     return clf
 
-
 def evaluate_all(clf, X_test, y_test, X_train=None, y_train=None):
     pred = clf.predict(X_test)
     report_text = classification_report(y_test, pred, digits=3)
-    report_dict = classification_report(y_test, pred, output_dict=True)  # <- add this
-    acc = float((y_test.to_numpy() == pred).mean()) 
+    report_dict = classification_report(y_test, pred, output_dict=True)
+    acc = float((y_test.to_numpy() == pred).mean())
     cm = confusion_matrix(y_test, pred, labels=clf.classes_)
 
     # Filter for Top-k metrics (ensure y_test ⊆ clf.classes_)
@@ -171,12 +205,12 @@ def evaluate_all(clf, X_test, y_test, X_train=None, y_train=None):
     y_topk = y_test.loc[mask]
     dropped = int((~mask).sum())
 
-    def topk_report(proba, classes, ks=(1,3,5)):
+    def topk_report(proba, classes, ks=(1, 3, 5)):
         vals = {}
         for k in ks:
             vals[f"Top-{k}"] = float(top_k_accuracy_score(y_topk, proba, k=k, labels=classes))
         # MRR
-        class_to_idx = {c:i for i,c in enumerate(classes)}
+        class_to_idx = {c: i for i, c in enumerate(classes)}
         y_idx = np.array([class_to_idx[y] for y in y_topk])
         ranks = proba.argsort(axis=1)[:, ::-1]
         pos = (ranks == y_idx[:, None]).argmax(axis=1) + 1
@@ -201,8 +235,8 @@ def evaluate_all(clf, X_test, y_test, X_train=None, y_train=None):
 
     return {
         "report_text": report_text,
-        "report_dict": report_dict,   # <- add this
-        "accuracy": acc,   
+        "report_dict": report_dict,
+        "accuracy": acc,
         "cm_shape": cm.shape,
         "dropped_for_topk": dropped,
         "topk": topk, "mrr": mrr,
@@ -344,3 +378,12 @@ def save_artifacts(path: Union[str, Path], **kwargs):
 def load_artifacts(path: Union[str, Path]):
     return joblib.load(path)
 
+__all__ = [
+    "safe_load_csv", "load_csv",
+    "build_ohe", "map_constructs", "construct_scores",
+    "fit_acuity_minmax", "train_rf", "evaluate_all",
+    "make_centroids", "make_predictor",
+    "triage_thresholds_from_proportions", "triage_thresholds_fixed",
+    "save_artifacts", "load_artifacts",
+    "CONSTRUCT_KEYWORDS",
+]
