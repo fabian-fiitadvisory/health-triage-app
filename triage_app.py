@@ -1,11 +1,8 @@
 # streamlit run triage_app.py
 # pip install streamlit
 # python -m streamlit run triage_app.py
-
-
-#source .venv/bin/activate
-#python -m streamlit run triage_app.py --server.port 5000
-
+# source .venv/bin/activate
+# python -m streamlit run triage_app.py --server.port 5000
 
 # triage_app.py
 
@@ -26,12 +23,6 @@ from model_pipeline import (
     triage_thresholds_from_proportions, triage_thresholds_fixed,
     save_artifacts, load_artifacts as _joblib_load_artifacts  # your helper
 )
-
-# ⚠️ Remove machine-specific sys.path on the cloud (keep local if you really need)
-# sys.path.append(
-#     '/Users/Fabian/Library/CloudStorage/GoogleDrive-'
-#     'fabian.francisco@fiitadvisory.nl/Mijn Drive/Projects/Data/Assets'
-# )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Page config
@@ -57,6 +48,35 @@ def load_local_artifacts():
     except Exception as e:
         st.warning(f"Failed to load local artifacts: {e}")
         return None
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper: build triage thresholds even if old artifacts lack them
+# ──────────────────────────────────────────────────────────────────────────────
+def build_triage_from_artifacts(art):
+    """
+    Returns (q_emerg, q_urgent, triage_func). If the artifact doesn't contain
+    thresholds, fallback to defaults (Emergency≥0.90, Urgent≥0.60).
+    """
+    q_e = art.get("q_emerg") if isinstance(art, dict) else None
+    q_u = art.get("q_urgent") if isinstance(art, dict) else None
+
+    if (q_e is not None) and (q_u is not None):
+        q_e, q_u = float(q_e), float(q_u)
+        def triage_func(a: float) -> str:
+            if a >= q_e:  return "Emergency"
+            if a >= q_u:  return "Urgent"
+            return "Routine"
+        return q_e, q_u, triage_func
+
+    # Fallback
+    q_e_default, q_u_default = 0.90, 0.60
+    st.info("Artifacts missing triage thresholds — using defaults (Emergency≥0.90, Urgent≥0.60). "
+            "Train once and re-save artifacts to persist real thresholds.")
+    def triage_func(a: float) -> str:
+        if a >= q_e_default:  return "Emergency"
+        if a >= q_u_default:  return "Urgent"
+        return "Routine"
+    return q_e_default, q_u_default, triage_func
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sidebar controls
@@ -110,33 +130,36 @@ if artifacts_local is not None:
     # =========================
     st.success("Using prebuilt artifacts (skipping training).")
 
-    # Unpack saved artifacts
-    clf_raw          = artifacts_local.get("clf")
-    cal_clf         = artifacts_local.get("cal_clf")     # may be None
-    ohe_vocab        = artifacts_local["ohe_vocab"]
-    construct_models = artifacts_local["construct_models"]
-    train_cols       = artifacts_local["train_cols"]
-    train_min        = artifacts_local["train_min"]
-    train_max        = artifacts_local["train_max"]
-    q_emerg          = artifacts_local["q_emerg"]
-    q_urgent         = artifacts_local["q_urgent"]
-    class_prior      = artifacts_local["class_prior"]
-    centroids_unit   = artifacts_local["centroids_unit"]
-    construct_only   = artifacts_local["construct_only"]
-    saved_use_cal    = artifacts_local.get("use_calibration", True)
-    saved_use_smooth = artifacts_local.get("use_smoothing", True)
-    saved_signal_thr = artifacts_local.get("signal_threshold", 0.05)
-    saved_prior_mix  = artifacts_local.get("prior_mix", 0.7)
-    saved_sim_temp   = artifacts_local.get("sim_temp", 0.5)
+    # Minimal required keys for inference
+    required = ["clf", "ohe_vocab", "construct_models", "train_cols", "train_min", "train_max"]
+    missing = [k for k in required if k not in artifacts_local]
+    if missing:
+        st.error(f"Artifacts are missing required entries: {missing}. "
+                 "Re-train locally and click 'Save artifacts' to create a complete bundle.")
+        st.stop()
 
-    # Pick model for inference (respect sidebar toggle if a calibrated model exists)
+    # Unpack (use .get for optional fields)
+    clf_raw          = artifacts_local.get("clf")
+    cal_clf         = artifacts_local.get("cal_clf")               # may be None
+    ohe_vocab        = artifacts_local.get("ohe_vocab", [])
+    construct_models = artifacts_local.get("construct_models", {})
+    train_cols       = artifacts_local.get("train_cols", [])
+    train_min        = artifacts_local.get("train_min", pd.Series(dtype=float))
+    train_max        = artifacts_local.get("train_max", pd.Series(dtype=float))
+    class_prior      = artifacts_local.get("class_prior", None)
+    centroids_unit   = artifacts_local.get("centroids_unit", None)
+    construct_only   = artifacts_local.get("construct_only", None)
+    saved_use_cal    = bool(artifacts_local.get("use_calibration", False))
+    saved_use_smooth = bool(artifacts_local.get("use_smoothing", True))
+    saved_signal_thr = float(artifacts_local.get("signal_threshold", 0.05))
+    saved_prior_mix  = float(artifacts_local.get("prior_mix", 0.7))
+    saved_sim_temp   = float(artifacts_local.get("sim_temp", 0.5))
+
+    # Pick model for inference (respect sidebar + availability)
     predictor_model = cal_clf if (use_calibration and cal_clf is not None) else clf_raw
 
-    # Rebuild triage function from saved thresholds
-    def triage_func(a: float) -> str:
-        if a >= q_emerg: return "Emergency"
-        if a >= q_urgent: return "Urgent"
-        return "Routine"
+    # Thresholds (robust to missing keys)
+    q_emerg, q_urgent, triage_func = build_triage_from_artifacts(artifacts_local)
 
     # Build predictor (no CSV/training needed)
     predict_patient = make_predictor(
