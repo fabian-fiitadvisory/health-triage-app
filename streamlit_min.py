@@ -1,4 +1,3 @@
-
 # streamlit run triage_app.py
 # pip install streamlit
 # python -m streamlit run triage_app.py
@@ -10,19 +9,20 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Imports
 # ──────────────────────────────────────────────────────────────────────────────
-import sys
+import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
+# import requests  # ← OPTIONAL (only if you enable the auto-download block below)
 
 from model_pipeline import (
     load_csv, build_ohe, map_constructs, construct_scores,
     fit_acuity_minmax, train_rf, evaluate_all,
     make_centroids, make_predictor,
     triage_thresholds_from_proportions, triage_thresholds_fixed,
-    save_artifacts, load_artifacts as _joblib_load_artifacts  # your helper
+    save_artifacts, load_artifacts as _joblib_load_artifacts
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -51,6 +51,31 @@ def load_local_artifacts():
         return None
 
 # ──────────────────────────────────────────────────────────────────────────────
+# (A1 - OPTIONAL) Auto-download artifact from a GitHub Release (disabled by default)
+# Add `requests` to requirements.txt and set a secret ARTIFACT_URL if you enable this.
+# ──────────────────────────────────────────────────────────────────────────────
+# ARTIFACT_PATH = "triage_model_artifacts.joblib"
+# ARTIFACT_URL = os.getenv("ARTIFACT_URL", "").strip()
+#
+# def ensure_artifact_present():
+#     if Path(ARTIFACT_PATH).exists():
+#         return True
+#     if not ARTIFACT_URL:
+#         return False
+#     try:
+#         st.info("Downloading model artifacts…")
+#         with requests.get(ARTIFACT_URL, stream=True, timeout=60) as r:
+#             r.raise_for_status()
+#             with open(ARTIFACT_PATH, "wb") as f:
+#                 for chunk in r.iter_content(1024 * 1024):
+#                     if chunk:
+#                         f.write(chunk)
+#         return Path(ARTIFACT_PATH).exists()
+#     except Exception as e:
+#         st.error(f"Failed to download artifacts: {e}")
+#         return False
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helper: build triage thresholds even if old artifacts lack them
 # ──────────────────────────────────────────────────────────────────────────────
 def build_triage_from_artifacts(art):
@@ -69,7 +94,7 @@ def build_triage_from_artifacts(art):
             return "Routine"
         return q_e, q_u, triage_func
 
-    # Fallback
+    # Fallback (only used if old artifacts didn’t save thresholds)
     q_e_default, q_u_default = 0.90, 0.60
     st.info("Artifacts missing triage thresholds — using defaults (Emergency≥0.90, Urgent≥0.60). "
             "Train once and re-save artifacts to persist real thresholds.")
@@ -110,7 +135,21 @@ sim_temp = st.sidebar.slider("Centroid softmax temperature", 0.1, 2.0, 0.5, 0.1)
 # ──────────────────────────────────────────────────────────────────────────────
 # (B) Mode select: attempt to load artifacts if requested
 # ──────────────────────────────────────────────────────────────────────────────
+# If you enable the optional downloader, call ensure_artifact_present() first:
+# if use_prebuilt:
+#     _ = ensure_artifact_present()
+
 artifacts_local = load_local_artifacts() if use_prebuilt else None
+
+# **FIX 1**: Early STOP if prebuilt requested but artifact missing on cloud
+if use_prebuilt and artifacts_local is None:
+    st.error(
+        "No prebuilt model artifacts found in this environment.\n\n"
+        "Options:\n"
+        "• Upload a .joblib in the **Load .joblib** section below, or\n"
+        "• Turn OFF **Use prebuilt artifacts** and upload a CSV to train here."
+    )
+    st.stop()
 
 # Flags/holders used across branches
 is_training_path = False
@@ -216,7 +255,15 @@ else:
             if "_id" not in df.columns:
                 df["_id"] = np.arange(len(df))
         else:
-            df = load_csv(csv_path)
+            # **FIX 2**: Only read csv_path if it exists on the cloud filesystem
+            p = Path(csv_path)
+            if not p.exists():
+                st.error(
+                    f"CSV not found at '{csv_path}'. Please upload a CSV in the sidebar "
+                    "or provide a valid path that exists on this server."
+                )
+                st.stop()
+            df = load_csv(p)
     st.write("**Data shape:**", df.shape)
 
     # Feature engineering
@@ -435,7 +482,7 @@ with c2:
     up = st.file_uploader("Load .joblib", type=["joblib"], key="art_up")
     if up is not None:
         try:
-            art = _joblib_load_artifacts(up)  # use your helper
+            art = _joblib_load_artifacts(up)
             st.success("Artifacts loaded.")
             st.json({
                 "has_calibrated": art.get("cal_clf") is not None,
@@ -449,5 +496,6 @@ with c2:
 # ──────────────────────────────────────────────────────────────────────────────
 # (F) If we skipped training, give a small note where evaluation would be
 # ──────────────────────────────────────────────────────────────────────────────
-if not is_training_path:
-    st.info("Running in artifacts mode: training metrics are not shown. Switch off 'Use prebuilt artifacts' to train/evaluate here.")
+if artifacts_local is not None:
+    st.info("Running in artifacts mode: training metrics are not shown. "
+            "Turn OFF 'Use prebuilt artifacts' to train/evaluate here (requires uploading a CSV).")
